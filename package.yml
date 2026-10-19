@@ -1,0 +1,280 @@
+name: sipp
+title: SIPp
+summary: Generates SIP traffic and runs SIP call scenarios from XML files, for load and functional tests of VoIP servers and proxies.
+homepage: https://github.com/SIPp/sipp
+# LICENSE.txt and most source files put SIPp under the GPL version 2 or
+# later, while upstream's README and include/auth.hpp say version 3 or later.
+# send_packets.c and send_packets.h are under the BSD-3-Clause license. With
+# auth.hpp and the distro's GSL, which is under the GPL version 3 or later,
+# the binary as a whole is under GPL-3.0-or-later.
+license: GPL-2.0-or-later AND BSD-3-Clause AND GPL-3.0-or-later
+source-release: true
+upstream:
+  source: github-release
+  repository: SIPp/sipp
+  # Release tags look like v3.8.0; release candidates (v3.7.0_rc1) do not
+  # match.
+  tag-pattern: '^v(\d+\.\d+\.\d+)$'
+  version-template: '{1}'
+  versioning: semver
+  version: 3.8.0
+  # Fix releases have followed within a week of a release.
+  cooldown: 72h
+  # SIPp publishes no checksums or signatures. The hash is the digest GitHub
+  # records for the release asset.
+  artifact:
+    url: https://github.com/SIPp/sipp/releases/download/v{version}/sipp-{version}.tar.gz
+    sha256: a3e3993bf9369caaae1f5366507d429acb9669dcf678cfacfd01c907102f74c3
+image:
+  entrypoint: [sipp]
+  cmd: [-h]
+test:
+  - |
+    same() { [ "$1" = "$2" ] || { echo "$3: got '$1', expected '$2'" >&2; exit 1; }; }
+    rc=0
+    sipp -v > version.txt || rc=$?
+    same "$rc" 99 'exit code of sipp -v'
+    # The version is followed by the features compiled in.
+    grep -Fqx " SIPp v$VERSION-TLS-SCTP-PCAP-LUA." version.txt \
+      || { echo 'unexpected sipp -v output:' >&2; cat version.txt >&2; exit 1; }
+    rc=0
+    sipp -nosuchoption > bad-option.txt 2>&1 || rc=$?
+    same "$rc" 255 'exit code for an unknown option'
+    grep -Fq "Invalid argument: '-nosuchoption'" bad-option.txt || { cat bad-option.txt >&2; exit 1; }
+    for s in 'uac:Basic Sipstone UAC' 'uas:Basic UAS responder' 'uac_pcap:UAC with media'; do
+      name=${s%%:*}
+      rc=0
+      sipp -sd "$name" > "$name.xml" || rc=$?
+      same "$rc" 99 "exit code of sipp -sd $name"
+      grep -Fq "<scenario name=\"${s#*:}\">" "$name.xml" || { echo "sipp -sd $name printed:" >&2; cat "$name.xml" >&2; exit 1; }
+    done
+    for f in g711a dtmf_2833_1; do
+      test -s "/usr/local/share/sipp/pcap/$f.pcap" || { echo "pcap/$f.pcap is missing" >&2; exit 1; }
+    done
+    ldd /usr/local/bin/sipp > libs.txt
+    for lib in libssl.so libcrypto.so libpcap.so libsctp.so libgsl.so libpugixml.so; do
+      grep -Fq "$lib" libs.txt || { echo "sipp does not load $lib" >&2; cat libs.txt >&2; exit 1; }
+    done
+    grep -Eq 'liblua-?5\.4\.so' libs.txt || { echo 'sipp does not load Lua 5.4' >&2; cat libs.txt >&2; exit 1; }
+    # An error in a Lua function ends SIPp with exit code 255, before the
+    # OPTIONS request is sent.
+    printf 'function greet()\n  error("no greeting today")\nend\n' > broken.lua
+    cat > options.xml <<'EOF'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <scenario name="options">
+      <nop>
+        <action>
+          <exec lua="greet"/>
+        </action>
+      </nop>
+      <send>
+        <![CDATA[
+          OPTIONS sip:[service]@[remote_ip]:[remote_port] SIP/2.0
+          Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+          From: <sip:sipp@[local_ip]>;tag=[call_number]
+          To: <sip:[service]@[remote_ip]:[remote_port]>
+          Call-ID: [call_id]
+          CSeq: [cseq] OPTIONS
+          Max-Forwards: 70
+          Content-Length: 0
+        ]]>
+      </send>
+    </scenario>
+    EOF
+    rc=0
+    sipp -sf options.xml -lua_file broken.lua -i 127.0.0.1 -p 5091 -m 1 -nostdin -timeout 10 \
+      127.0.0.1:5090 > broken.log 2>&1 || rc=$?
+    if [ "$rc" != 255 ] || ! grep -Fq 'no greeting today' broken.log; then
+      echo "a Lua error gave exit code $rc, expected 255:" >&2; cat broken.log >&2; exit 1
+    fi
+  - |
+    # The built-in UAS and UAC place three calls over each transport on the
+    # loopback interface. Over TLS each side verifies the other's
+    # certificate, a self-signed one for 127.0.0.1 made for this test only.
+    cat > cert.pem <<'EOF'
+    -----BEGIN CERTIFICATE-----
+    MIIBjzCCATagAwIBAgIUEs6wd4v1HFZskCO/wbvKZg787p0wCgYIKoZIzj0EAwIw
+    FDESMBAGA1UEAwwJMTI3LjAuMC4xMCAXDTI2MDEwMTAwMDAwMFoYDzIxMjUxMjMx
+    MjM1OTU5WjAUMRIwEAYDVQQDDAkxMjcuMC4wLjEwWTATBgcqhkjOPQIBBggqhkjO
+    PQMBBwNCAAQrkfsnaJ5RWIu/7g23o+9F3uVBY0KAh01QYGxY0rqsJe8Jf748joMJ
+    vT7OenL2EpZ247/DJD4rGLR+waRJOp7Mo2QwYjAdBgNVHQ4EFgQUCDgqhk8E93C3
+    7+BI+unPE13orDkwHwYDVR0jBBgwFoAUCDgqhk8E93C37+BI+unPE13orDkwDwYD
+    VR0TAQH/BAUwAwEB/zAPBgNVHREECDAGhwR/AAABMAoGCCqGSM49BAMCA0cAMEQC
+    IF3kgL5S5YLH+D0teaB7Wc+IoHXJx7wdhTHZGxgCEkH+AiAsX6tBT7MSvnyt1qms
+    zmWVDjoIct3qTBOtMEnwmy+uug==
+    -----END CERTIFICATE-----
+    EOF
+    cat > key.pem <<'EOF'
+    -----BEGIN PRIVATE KEY-----
+    MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg4WEE3eUBeZCpoLVX
+    g6EXV6vnEh7XcAQUqy3bHNo/WtahRANCAAQrkfsnaJ5RWIu/7g23o+9F3uVBY0KA
+    h01QYGxY0rqsJe8Jf748joMJvT7OenL2EpZ247/DJD4rGLR+waRJOp7M
+    -----END PRIVATE KEY-----
+    EOF
+    # Waits until /proc/net/$1 has a socket on port $2, listening for TCP.
+    await() {
+      hex=$(printf ':%04X' "$2")
+      n=0
+      until cat "/proc/net/$1" "/proc/net/${1}6" 2> /dev/null \
+        | awk -v p="$hex" -v t="$1" 'substr($2, length($2) - 4) == p && (t == "udp" || $4 == "0A") { f = 1 } END { exit !f }'; do
+        n=$((n + 1))
+        if [ "$n" -gt 100 ] || ! kill -0 "$3" 2> /dev/null; then
+          echo "the UAS does not listen on $1 port $2:" >&2; cat "$4" >&2; exit 1
+        fi
+        sleep 0.1
+      done
+    }
+    port=5070
+    for t in u1:UDP:udp t1:TCP:tcp w1:WS:tcp l1:TLS:tcp x1:WSS:tcp; do
+      mode=${t%%:*}; rest=${t#*:}; name=${rest%%:*}; proto=${rest#*:}
+      case $mode in
+        l1 | x1) set -- -tls_cert cert.pem -tls_key key.pem -tls_ca cert.pem ;;
+        *) set -- ;;
+      esac
+      sipp -sn uas -t "$mode" -i 127.0.0.1 -p "$port" -m 3 -nostdin -timeout 60 -timeout_error \
+        -trace_msg -message_file "uas-$mode.msg" "$@" > "uas-$mode.log" 2>&1 &
+      uas=$!
+      await "$proto" "$port" "$uas" "uas-$mode.log"
+      sipp -sn uac -t "$mode" -i 127.0.0.1 -p $((port + 1)) -m 3 -r 10 -nostdin -timeout 60 -timeout_error \
+        "$@" "127.0.0.1:$port" > "uac-$mode.log" 2>&1 \
+        || { echo "the $name UAC exited with $?:" >&2; cat "uac-$mode.log" >&2; exit 1; }
+      wait "$uas" || { echo "the $name UAS exited with $?:" >&2; cat "uas-$mode.log" >&2; exit 1; }
+      # Each call is an INVITE, an ACK and a BYE. Over UDP a request may be
+      # sent again.
+      got=$(grep -c "^$name message received" "uas-$mode.msg" || true)
+      if [ "$got" -lt 9 ] || { [ "$proto" = tcp ] && [ "$got" -ne 9 ]; }; then
+        echo "the $name UAS got $got requests, expected 9" >&2; cat "uas-$mode.msg" >&2; exit 1
+      fi
+      port=$((port + 2))
+    done
+  - |
+    # Scenario files: a UAC registers each user of a CSV file, answers the
+    # digest challenge with the password from the file, and sends a header
+    # that a Lua function writes. The UAS checks the password against the
+    # same file.
+    printf 'SEQUENTIAL\nalice;secret\nbob;hunter2\n' > users.csv
+    cat > greet.lua <<'EOF'
+    function greet(name, n)
+      sipp.set("greeting", "hello " .. name .. " " .. (tonumber(n) + 1))
+      sipp.log("greeted " .. name)
+    end
+    EOF
+    cat > uac.xml <<'EOF'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <scenario name="register">
+      <nop>
+        <action>
+          <assignstr assign_to="count" value="20"/>
+          <exec lua="greet [field0] [$count]"/>
+        </action>
+      </nop>
+      <send>
+        <![CDATA[
+          REGISTER sip:127.0.0.1:5080 SIP/2.0
+          Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+          From: <sip:[field0]@127.0.0.1>;tag=[call_number]
+          To: <sip:[field0]@127.0.0.1>
+          Call-ID: [call_id]
+          CSeq: [cseq] REGISTER
+          Max-Forwards: 70
+          Content-Length: 0
+        ]]>
+      </send>
+      <recv response="401" auth="true"/>
+      <send>
+        <![CDATA[
+          REGISTER sip:127.0.0.1:5080 SIP/2.0
+          Via: SIP/2.0/[transport] [local_ip]:[local_port];branch=[branch]
+          From: <sip:[field0]@127.0.0.1>;tag=[call_number]
+          To: <sip:[field0]@127.0.0.1>
+          Call-ID: [call_id]
+          CSeq: [cseq] REGISTER
+          Max-Forwards: 70
+          X-Greeting: [$greeting]
+          [authentication username=[field0] password=[field1]]
+          Content-Length: 0
+        ]]>
+      </send>
+      <recv response="200"/>
+    </scenario>
+    EOF
+    cat > uas.xml <<'EOF'
+    <?xml version="1.0" encoding="UTF-8"?>
+    <scenario name="registrar">
+      <recv request="REGISTER"/>
+      <send>
+        <![CDATA[
+          SIP/2.0 401 Unauthorized
+          [last_Via:]
+          [last_From:]
+          [last_To:];tag=srv
+          [last_Call-ID:]
+          [last_CSeq:]
+          WWW-Authenticate: Digest realm="test", nonce="n[call_number]", algorithm=MD5
+          Content-Length: 0
+        ]]>
+      </send>
+      <recv request="REGISTER">
+        <action>
+          <verifyauth assign_to="valid" username="[field0]" password="[field1]"/>
+        </action>
+      </recv>
+      <nop test="valid" next="ok"/>
+      <send next="end">
+        <![CDATA[
+          SIP/2.0 403 Forbidden
+          [last_Via:]
+          [last_From:]
+          [last_To:];tag=srv
+          [last_Call-ID:]
+          [last_CSeq:]
+          Content-Length: 0
+        ]]>
+      </send>
+      <label id="ok"/>
+      <send>
+        <![CDATA[
+          SIP/2.0 200 OK
+          [last_Via:]
+          [last_From:]
+          [last_To:];tag=srv
+          [last_Call-ID:]
+          [last_CSeq:]
+          Content-Length: 0
+        ]]>
+      </send>
+      <label id="end"/>
+    </scenario>
+    EOF
+    sipp -sf uas.xml -inf users.csv -i 127.0.0.1 -p 5080 -m 2 -nostdin -timeout 60 -timeout_error \
+      -trace_msg -message_file uas.msg > uas.log 2>&1 &
+    uas=$!
+    # The UAC sends each request once, so it starts when UDP port 5080 (13D8)
+    # is open.
+    n=0
+    until awk '$2 ~ /:13D8$/ { f = 1 } END { exit !f }' /proc/net/udp; do
+      n=$((n + 1))
+      [ "$n" -le 100 ] || { echo 'the UAS does not listen on UDP port 5080:' >&2; cat uas.log >&2; exit 1; }
+      sleep 0.1
+    done
+    # -l 1 places the calls one after the other, so the UAS reads the CSV
+    # lines in the same order.
+    sipp -sf uac.xml -inf users.csv -lua_file greet.lua -trace_logs -log_file lua.log \
+      -i 127.0.0.1 -p 5081 -m 2 -l 1 -nostdin -timeout 60 -timeout_error 127.0.0.1:5080 > uac.log 2>&1 \
+      || { echo "the UAC exited with $?:" >&2; cat uac.log >&2; exit 1; }
+    wait "$uas" || { echo "the UAS exited with $?:" >&2; cat uas.log >&2; exit 1; }
+    for user in alice bob; do
+      grep -Fq "X-Greeting: hello $user 21" uas.msg || { echo "no greeting for $user" >&2; cat uas.msg >&2; exit 1; }
+      grep -Fq "greeted $user" lua.log || { echo "no Lua log line for $user" >&2; cat lua.log >&2; exit 1; }
+    done
+examples:
+  - title: Answer calls with the built-in UAS scenario on port 5060
+    command: docker run --rm --network host ghcr.io/randomcontainers/sipp -sn uas -p 5060
+  - title: Place 100 calls at 10 calls per second with the built-in UAC scenario
+    command: docker run --rm --network host ghcr.io/randomcontainers/sipp -sn uac -r 10 -m 100 <server>:5060
+  - title: Run a scenario file with values from a CSV file in the current directory
+    command: docker run --rm --network host --user "$(id -u):$(id -g)" -v "$PWD:/work" ghcr.io/randomcontainers/sipp -sf scenario.xml -inf users.csv -m 50 <server>:5060
+  - title: Watch the live statistics screen while calls run
+    command: docker run --rm -it --network host ghcr.io/randomcontainers/sipp -sn uac -r 10 <server>:5060
+  - title: Play RTP audio from a capture file during the call (needs root and NET_RAW)
+    command: docker run --rm --user 0 --cap-add NET_RAW --network host -w /usr/local/share/sipp ghcr.io/randomcontainers/sipp -sn uac_pcap -m 1 <server>:5060
