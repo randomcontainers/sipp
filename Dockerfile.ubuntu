@@ -1,0 +1,133 @@
+# syntax=docker/dockerfile:1.27.0@sha256:bde3983e9c939224420ddaf6b784cc30e09b035a4dea01f581230c50809f372e
+# check=error=true
+
+ARG BASE_IMAGE=ubuntu:26.04
+
+FROM ${BASE_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
+# The base image's own packages are recorded first so they can be left out of
+# runtime-deps.
+RUN dpkg-query -W -f '${Package}\n' | LC_ALL=C sort -u > /tmp/base-packages; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      cmake \
+      libgsl-dev \
+      liblua5.4-dev \
+      libncurses-dev \
+      libpcap-dev \
+      libpugixml-dev \
+      libsctp-dev \
+      libssl-dev \
+      pkgconf; \
+    rm -rf /var/lib/apt/lists/*
+
+ARG VERSION
+ARG SOURCE_SHA256
+ADD --checksum=sha256:${SOURCE_SHA256} https://github.com/SIPp/sipp/releases/download/v${VERSION}/sipp-${VERSION}.tar.gz /src/sipp.tar.gz
+WORKDIR /src/sipp
+# The release tarball carries include/version.h, which gives the binary its
+# version without git. Each optional library is set to ON, so the build
+# fails instead of leaving out a feature when its library is missing. The
+# distro's pugixml is used instead of the copy in third_party. Only the sipp
+# binary is installed: sipp-multi.py would need Python. The capture files go
+# to /usr/local/share/sipp/pcap, where the uac_pcap scenario finds them as
+# pcap/*.pcap when it runs in /usr/local/share/sipp. Release is kept at -O2
+# instead of -O3: on ppc64el, GCC 15 has reported a false stringop-overflow
+# in rtpstream.cpp that upstream's -Werror turns into an error
+# (LP: #2134582), from vector resize code that 3.8.0 still has.
+ARG JOBS
+RUN tar -xzf /src/sipp.tar.gz --strip-components=1; \
+    grep -Fqx "#define VERSION \"v${VERSION}\"" include/version.h \
+      || { cat include/version.h >&2; echo "include/version.h is not for v${VERSION}" >&2; exit 1; }; \
+    set -- \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_C_FLAGS_RELEASE='-O2 -DNDEBUG' \
+      -DCMAKE_CXX_FLAGS_RELEASE='-O2 -DNDEBUG' \
+      -DUSE_PCAP=ON \
+      -DUSE_GSL=ON \
+      -DUSE_SCTP=ON \
+      -DUSE_LUA=ON \
+      -DUSE_SYSTEM_PUGIXML=ON \
+      -DUSE_WOLFSSL=OFF \
+      -DTLS_KEY_LOGGING=OFF \
+      -DBUILD_STATIC=OFF; \
+    echo "$*" > /tmp/cmake-options; \
+    cmake -S . -B build "$@"; \
+    cmake --build build -j"${JOBS:-$(nproc)}" --target sipp; \
+    install -D -m 0755 -s build/sipp /out/usr/local/bin/sipp; \
+    install -d /out/usr/local/share/sipp/pcap; \
+    install -m 0644 pcap/*.pcap /out/usr/local/share/sipp/pcap/
+
+# The options above only fail for a missing library file, so the libraries
+# sipp links and the features it reports are checked as well. sipp -v exits
+# with 99.
+RUN readelf -d /out/usr/local/bin/sipp > /tmp/dynamic; \
+    for lib in libssl.so libcrypto.so libpcap.so libsctp.so libgsl.so liblua5.4.so libpugixml.so; do \
+      grep -Fq "Shared library: [$lib" /tmp/dynamic \
+        || { cat /tmp/dynamic >&2; echo "sipp does not link $lib" >&2; exit 1; }; \
+    done; \
+    rc=0; \
+    /out/usr/local/bin/sipp -v > /tmp/sipp-version || rc=$?; \
+    test "$rc" -eq 99 || { cat /tmp/sipp-version >&2; echo "sipp -v exited with $rc" >&2; exit 1; }; \
+    grep -Fqx " SIPp v${VERSION}-TLS-SCTP-PCAP-LUA." /tmp/sipp-version \
+      || { cat /tmp/sipp-version >&2; echo "sipp -v does not show v${VERSION} with TLS, SCTP, PCAP and LUA" >&2; exit 1; }
+
+ARG BASE_IMAGE
+# runtime-deps lists the packages that own the libraries sipp loads, minus
+# the base image's packages, plus the packages in runtime-deps.ubuntu.
+# LICENSE.txt has the GPL version 2 and the BSD license of send_packets.c
+# and send_packets.h. GPL-3 is the text of the GPL version 3, which covers
+# include/auth.hpp and the GSL that sipp links.
+RUN --mount=type=bind,source=runtime-deps.ubuntu,target=/tmp/runtime-deps.extra \
+    --mount=type=bind,source=licenses/GPL-3,target=/tmp/GPL-3 \
+    export LC_ALL=C; \
+    meta=/out/usr/local/share/randomcontainers/sipp; \
+    mkdir -p "$meta/licenses"; \
+    cp LICENSE.txt "$meta/licenses/"; \
+    grep -q 'GNU GENERAL PUBLIC LICENSE' "$meta/licenses/LICENSE.txt"; \
+    grep -q 'Copyright (c) 2001-2004 Aaron Turner' "$meta/licenses/LICENSE.txt"; \
+    cp /tmp/GPL-3 "$meta/licenses/GPL-3"; \
+    grep -q 'Version 3, 29 June 2007' "$meta/licenses/GPL-3"; \
+    echo "${VERSION}" > "$meta/version"; \
+    printf '%s\n' \
+      "https://github.com/SIPp/sipp/releases/download/v${VERSION}/sipp-${VERSION}.tar.gz" \
+      "https://github.com/randomcontainers/sipp/releases/tag/v${VERSION}" \
+      > "$meta/source"; \
+    { \
+      echo "base: ${BASE_IMAGE}"; \
+      echo "compiler: $(c++ --version | sed -n 1p)"; \
+      echo "sipp: ${VERSION} sha256:${SOURCE_SHA256}"; \
+      echo "cmake: $(cat /tmp/cmake-options)"; \
+      for pc in openssl libpcap gsl lua5.4 pugixml ncursesw; do \
+        echo "${pc}: $(pkg-config --modversion "$pc")"; \
+      done; \
+      echo "libsctp: $(dpkg-query -W -f '${Version}' libsctp-dev)"; \
+      sed -n 2p /tmp/sipp-version; \
+    } > "$meta/buildinfo"; \
+    find /out/usr/local -type f -perm -u+x -print0 \
+      | xargs -0 ldd > /tmp/ldd 2>&1 || true; \
+    if grep 'not found' /tmp/ldd; then exit 1; fi; \
+    awk '$2 == "=>" && $3 ~ /^\// { print $3 }' /tmp/ldd | sort -u > /tmp/libs; \
+    test -s /tmp/libs; \
+    while read -r lib; do \
+      real="$(readlink -f "$lib")"; \
+      dpkg-query --search "*${real#/usr}"; \
+    done < /tmp/libs | cut -d: -f1 | sort -u | comm -23 - /tmp/base-packages > /tmp/elf-deps; \
+    sort -u /tmp/elf-deps /tmp/runtime-deps.extra > "$meta/runtime-deps"
+
+FROM ${BASE_IMAGE} AS slim
+ARG DEBIAN_FRONTEND=noninteractive
+RUN --mount=type=bind,from=build,source=/out/usr/local/share/randomcontainers/sipp/runtime-deps,target=/tmp/runtime-deps \
+    set -eu; \
+    apt-get update; \
+    xargs apt-get install -y --no-install-recommends ca-certificates tini < /tmp/runtime-deps; \
+    rm -rf /var/lib/apt/lists/*; \
+    install -d -m 1777 /work /cache
+COPY --link --from=build /out/usr/local/ /usr/local/
+ENV LANG=C.UTF-8 XDG_CACHE_HOME=/cache
+WORKDIR /work
+USER 1000:1000
+ENTRYPOINT ["tini", "--", "sipp"]
+CMD ["-h"]
